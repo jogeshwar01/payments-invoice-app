@@ -1,0 +1,391 @@
+openapi: 3.0.3
+info:
+  title: Dodo Payments — Invoice & Payment Service
+  version: "0.1.0"
+  description: |
+    Minimal invoice & payment service. All endpoints under /v1 require
+    `Authorization: Bearer dodo_sk_live_...` except `POST /v1/businesses`
+    which is the bootstrap endpoint (no auth).
+
+    Error format (all routes):
+
+        { "error": { "type": "...", "message": "...", "request_id": "..." } }
+
+servers:
+  - url: http://localhost:8080
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            type:
+              type: string
+              example: invalid_state_transition
+            message:
+              type: string
+            request_id:
+              type: string
+              format: uuid
+    LineItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        description: { type: string }
+        quantity: { type: integer, minimum: 1 }
+        unit_amount_cents: { type: integer, format: int64, minimum: 0 }
+        position: { type: integer }
+    LineItemInput:
+      type: object
+      required: [description, quantity, unit_amount_cents]
+      properties:
+        description: { type: string }
+        quantity: { type: integer, minimum: 1 }
+        unit_amount_cents: { type: integer, format: int64, minimum: 0 }
+    Customer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string }
+        created_at: { type: string, format: date-time }
+    Invoice:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        customer_id: { type: string, format: uuid }
+        state:
+          type: string
+          enum: [draft, open, processing, paid, void, uncollectible]
+        total_cents: { type: integer, format: int64 }
+        currency: { type: string, example: USD }
+        due_date: { type: string, format: date, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        line_items:
+          type: array
+          items: { $ref: '#/components/schemas/LineItem' }
+    PaymentAttempt:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        invoice_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [pending, succeeded, failed]
+        psp_ref: { type: string, nullable: true }
+        failure_code: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time, nullable: true }
+    WebhookEndpoint:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string }
+        signing_secret_prefix: { type: string }
+        active: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      summary: Healthcheck
+      security: []
+      responses:
+        "200":
+          description: ok
+
+  /v1/businesses:
+    post:
+      summary: Bootstrap a business and receive its first API key (plaintext, one-time).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+                  name: { type: string }
+                  api_key: { type: string, example: "dodo_sk_live_..." }
+                  api_key_prefix: { type: string }
+
+  /v1/customers:
+    post:
+      summary: Create a customer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email]
+              properties:
+                name: { type: string }
+                email: { type: string }
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Customer' }
+    get:
+      summary: List customers (most recent 100)
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Customer' }
+
+  /v1/customers/{id}:
+    get:
+      summary: Get a customer
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Customer' }
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/invoices:
+    post:
+      summary: Create an invoice. Server computes total from line items.
+      parameters:
+        - in: query
+          name: finalize
+          schema: { type: boolean, default: false }
+          description: If true, creates the invoice in `open` state directly.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customer_id, line_items]
+              properties:
+                customer_id: { type: string, format: uuid }
+                due_date: { type: string, format: date, nullable: true }
+                line_items:
+                  type: array
+                  minItems: 1
+                  items: { $ref: '#/components/schemas/LineItemInput' }
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invoice' }
+    get:
+      summary: List invoices, optionally filtered by state
+      parameters:
+        - in: query
+          name: state
+          schema:
+            type: string
+            enum: [draft, open, processing, paid, void, uncollectible]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Invoice' }
+
+  /v1/invoices/{id}:
+    get:
+      summary: Get an invoice with its line items
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invoice' }
+
+  /v1/invoices/{id}/finalize:
+    post:
+      summary: Transition a draft invoice to open
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invoice' }
+        "422":
+          description: invalid_state_transition
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/invoices/{id}/void:
+    post:
+      summary: Void an invoice (terminal)
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invoice' }
+
+  /v1/invoices/{id}/pay:
+    post:
+      summary: Attempt payment on an invoice.
+      description: |
+        Requires the `Idempotency-Key` header. Two concurrent calls with
+        different keys are serialised by a row lock; the second receives
+        409 `payment_in_progress`. Same-key replays return the cached
+        response without a second PSP call. Same-key with a different
+        body returns 409 `idempotency_key_conflict`.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: { type: string, maxLength: 256 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [card_token]
+              properties:
+                card_token:
+                  type: string
+                  description: Mock PSP card token. See README.
+                  example: tok_success
+      responses:
+        "200":
+          description: succeeded or failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentAttempt' }
+        "202":
+          description: pending (PSP timed out; reconciler will resolve)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentAttempt' }
+        "409":
+          description: idempotency_key_conflict or payment_in_progress
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "422":
+          description: invalid_state_for_payment
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/webhook_endpoints:
+    post:
+      summary: Register a webhook endpoint. Returns the signing secret once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, format: uri }
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+                  url: { type: string }
+                  signing_secret: { type: string, example: "whsec_..." }
+                  active: { type: boolean }
+                  created_at: { type: string, format: date-time }
+    get:
+      summary: List registered webhook endpoints
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/WebhookEndpoint' }
+
+  /v1/webhook_endpoints/{id}:
+    delete:
+      summary: Remove a webhook endpoint
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204":
+          description: deleted
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
